@@ -1,0 +1,165 @@
+DROP TABLE IF EXISTS customers_temp;
+DROP TABLE IF EXISTS people_temp;
+DROP TABLE IF EXISTS organizations_temp;
+DROP TABLE IF EXISTS customers;
+DROP TABLE IF EXISTS people;
+DROP TABLE IF EXISTS organizations;
+
+-- создание временных таблиц
+CREATE TEMPORARY TABLE IF NOT EXISTS customers_temp (
+index INT,
+customer_id STRING,
+first_name STRING,
+last_name STRING,
+company STRING,
+city STRING,
+country STRING,
+phone_1 STRING,
+phone_2 STRING,
+email STRING,
+subscription_date DATE,
+website STRING,
+subscription_year SMALLINT,
+groups SMALLINT
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\t'
+TBLPROPERTIES ("skip.header.line.count"="1"); 
+
+CREATE TEMPORARY TABLE IF NOT EXISTS people_temp (
+index INT,
+user_id STRING,
+first_name STRING,
+last_name STRING,
+sex STRING,
+email STRING,
+phone STRING,
+date_of_birth DATE,
+job_title STRING,
+groups SMALLINT
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\t'
+TBLPROPERTIES ("skip.header.line.count"="1");
+
+CREATE TEMPORARY TABLE IF NOT EXISTS organizations_temp (
+index INT,
+organization_id STRING,
+name STRING,
+website STRING,
+country STRING,
+description STRING,
+founded INT,
+industry STRING,
+number_of_employees INT,
+groups SMALLINT
+)
+ROW FORMAT DELIMITED
+FIELDS TERMINATED BY '\t'
+TBLPROPERTIES ("skip.header.line.count"="1");
+
+-- загрузка данных во временные таблицы
+LOAD DATA INPATH '/user/shiva/customers_with_groups.csv' INTO TABLE customers_temp;
+LOAD DATA INPATH '/user/shiva/people_with_groups.csv' INTO TABLE people_temp;
+LOAD DATA INPATH '/user/shiva/organizations_with_groups.csv' INTO TABLE organizations_temp;
+
+-- проверка загруженных данных
+SELECT * FROM customers_temp
+LIMIT 5;
+SELECT * FROM people_temp
+LIMIT 5;
+SELECT * FROM organizations_temp
+LIMIT 5;
+
+-- cоздание постоянных таблиц
+CREATE TABLE IF NOT EXISTS customers (
+index INT,
+customer_id STRING,
+first_name STRING,
+last_name STRING,
+company STRING,
+city STRING,
+country STRING,
+phone_1 STRING,
+phone_2 STRING,
+email STRING,
+subscription_date DATE,
+website STRING,
+subscription_year SMALLINT
+)
+PARTITIONED BY (groups SMALLINT)
+CLUSTERED BY(index) INTO 10 BUCKETS
+STORED AS PARQUET;
+
+CREATE TABLE IF NOT EXISTS people (
+index INT,
+user_id STRING,
+first_name STRING,
+last_name STRING,
+sex STRING,
+email STRING,
+phone STRING,
+date_of_birth DATE,
+job_title STRING,
+groups SMALLINT,
+age_group STRING
+)
+CLUSTERED BY(index) INTO 10 BUCKETS
+STORED AS PARQUET;
+
+CREATE TABLE IF NOT EXISTS organizations (
+index INT,
+organization_id STRING,
+name STRING,
+website STRING,
+country STRING,
+description STRING,
+founded INT,
+industry STRING,
+number_of_employees INT
+)
+PARTITIONED BY (groups SMALLINT)
+CLUSTERED BY (index) INTO 10 BUCKETS
+STORED AS PARQUET;
+
+-- загрузка данных из временных таблиц в постоянные с учетом партиций
+set hive.exec.dynamic.partition.mode=nonstrict;
+INSERT INTO customers PARTITION (groups) SELECT * FROM customers_temp;
+
+INSERT INTO people
+SELECT index, user_id, first_name, last_name, sex, email, phone, date_of_birth, job_title, groups,
+CASE 
+    WHEN YEAR(CURRENT_DATE) - YEAR(date_of_birth) BETWEEN 0 AND 18 THEN '0-18'
+    WHEN YEAR(CURRENT_DATE) - YEAR(date_of_birth) BETWEEN 19 AND 25 THEN '18-25'
+    WHEN YEAR(CURRENT_DATE) - YEAR(date_of_birth) BETWEEN 26 AND 35 THEN '26-35'
+    WHEN YEAR(CURRENT_DATE) - YEAR(date_of_birth) BETWEEN 36 AND 45 THEN '36-45'
+    WHEN YEAR(CURRENT_DATE) - YEAR(date_of_birth) BETWEEN 46 AND 55 THEN '46-55'
+    WHEN YEAR(CURRENT_DATE) - YEAR(date_of_birth) BETWEEN 56 AND 65 THEN '56-65'
+    ELSE '> 65'
+    END AS age_group
+FROM people_temp;
+
+INSERT INTO organizations PARTITION (groups) SELECT * FROM organizations_temp;
+
+-- проверка загруженных значений
+SELECT * FROM customers
+LIMIT 5;
+SELECT * FROM people 
+LIMIT 5;
+SELECT * FROM organizations
+LIMIT 5;
+
+-- создание сводной статистики целевой возрастной группы подписчиков на уровне каждой компании и на уровне каждого года
+SELECT DISTINCT temp2.company AS Company, temp2.subscription_year AS Year, temp2.age_group AS Age_group, temp2.group_count AS Subscriptions_count
+FROM
+    (SELECT DISTINCT temp.company, temp.subscription_year, temp.age_group, temp.group_count, 
+                    MAX(temp.group_count) OVER (PARTITION BY temp.subscription_year_company) AS max_count
+    FROM 
+        (SELECT company, subscription_year, age_group, COUNT(age_group) AS group_count,
+        CONCAT(CAST(c.subscription_year AS string), '_', CAST(c.company AS string)) AS subscription_year_company 
+        FROM people p
+        INNER JOIN customers c ON p.index = c.index
+        GROUP BY company, subscription_year, age_group) AS temp
+    ) AS temp2
+WHERE temp2.group_count = temp2.max_count
+-- AND temp2.group_count >1 --целесообразно либо указать ограничение на количество подписчиков, либо укрупнить возрастные группы
